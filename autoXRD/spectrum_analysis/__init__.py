@@ -1,6 +1,6 @@
 from scipy.signal import find_peaks, filtfilt, resample
-from tensorflow.keras.utils import custom_object_scope
 from autoXRD.dara import do_refinement_no_saving
+from autoXRD.cnn import XRDModel
 from pymatgen.analysis.diffraction import xrd
 from scipy.ndimage import gaussian_filter1d
 from multiprocessing import Pool, Manager
@@ -9,7 +9,7 @@ from pymatgen.core import Structure
 import matplotlib.pyplot as plt
 from skimage import restoration
 from pathlib import Path
-import tensorflow as tf
+import torch
 from scipy import signal
 from pyts import metrics
 import multiprocessing
@@ -21,29 +21,10 @@ import random
 import shutil
 import math
 import os
-
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+from typing import List, Sequence, Tuple
 
 np.random.seed(1)
-tf.random.set_seed(1)
-
-# Used to apply dropout during training *and* inference
-class CustomDropout(tf.keras.layers.Layer):
-
-    def __init__(self, rate, **kwargs):
-        super(CustomDropout, self).__init__(**kwargs)
-        self.rate = rate
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "rate": self.rate
-        })
-        return config
-
-    # Always apply dropout
-    def call(self, inputs, training=None):
-        return tf.nn.dropout(inputs, rate=self.rate)
+torch.manual_seed(1)
 
 
 class SpectrumAnalyzer(object):
@@ -52,7 +33,7 @@ class SpectrumAnalyzer(object):
     """
 
     def __init__(self, spectra_dir, spectrum_fname, max_phases, cutoff_intensity, min_conf=25.0, wavelen='CuKa',
-        reference_dir='References', min_angle=10.0, max_angle=80.0, model_path='Model.h5', is_pdf=False):
+        reference_dir='References', min_angle=10.0, max_angle=80.0, model_path='Model.pth', is_pdf=False):
         """
         Args:
             spectrum_fname: name of file containing the
@@ -91,12 +72,15 @@ class SpectrumAnalyzer(object):
 
         spectrum = self.formatted_spectrum
 
-        with custom_object_scope({'CustomDropout': CustomDropout}):
-            self.model = tf.keras.models.load_model(self.model_path, compile=False)
+        self.model = XRDModel(len(self.reference_phases), is_pdf=self.is_pdf)
+        self.model.load_state_dict(torch.load(self.model_path, map_location="cpu"))
+        self.model.eval()
 
-        self.kdp = KerasDropoutPrediction(self.model)
+        self.kdp = TorchDropoutPrediction(self.model)
 
-        prediction_list, confidence_list, backup_list, scale_list, spec_list = self.enumerate_routes(spectrum)
+        prediction_list, confidence_list, backup_list, scale_list, spec_list = self.enumerate_routes(
+            spectrum
+        )
 
         return prediction_list, confidence_list, backup_list, scale_list, spec_list
 
@@ -215,7 +199,7 @@ class SpectrumAnalyzer(object):
 
         Args:
             xrd_spectrum: a numpy array containing the measured spectrum that is to be classified
-            kdp: a KerasDropoutPrediction model object
+            kdp: a TorchDropoutPrediction model object
             reference_phases: a list of reference phase strings
             indiv_conf: list of probabilities associated with an individual mixture (one per branch)
             indiv_pred: list of predicted phases in an individual mixture (one per branch)
@@ -595,62 +579,49 @@ class SpectrumAnalyzer(object):
         return pdf
 
 
-class KerasDropoutPrediction(object):
-    """
-    Ensemble model used to provide a probability distribution associated
-    with suspected phases in a given xrd spectrum.
-    """
+class TorchDropoutPrediction(object):
+    """Monte Carlo dropout wrapper for a PyTorch model."""
 
-    def __init__(self, model):
-        """
-        Args:
-            model: trained convolutional neural network
-                (tensorflow.keras Model object)
-        """
-
+    def __init__(self, model: XRDModel) -> None:
         self.model = model
 
-    def predict(self, x, min_conf=10.0, n_iter=100):
-        """
-        Args:
-            x: xrd spectrum to be classified
-        Returns:
-            prediction: distribution of probabilities associated with reference phases
-            len(certainties): number of phases with probabilities > 10%
-            certanties: associated probabilities
-        """
+    def predict(
+        self, x: Sequence[float], min_conf: float = 10.0, n_iter: int = 100
+    ) -> Tuple[np.ndarray, int, List[float], int]:
+        """Return mean prediction and associated confidences."""
 
-        # Convert from % to 0-1 fractional
         if min_conf > 1.0:
             min_conf /= 100.0
 
-        # Format input
-        x = np.array([x])
+        tensor_x = (
+            torch.tensor(x, dtype=torch.float32)
+            .view(1, 1, -1)
+        )
 
-        # Monte Carlo Dropout
-        result = []
-        for _ in range(n_iter):
-            result.append(self.model(x))
+        result: List[np.ndarray] = []
+        self.model.eval()
+        with torch.no_grad():
+            for _ in range(n_iter):
+                out = self.model(tensor_x)
+                prob = torch.softmax(out, dim=1).cpu().numpy()
+                result.append(prob.flatten())
 
-        result = np.array([list(np.array(sublist).flatten()) for sublist in result]) ## Individual predictions
-        prediction = result.mean(axis=0) ## Average prediction
+        result_arr = np.array(result)
+        prediction = result_arr.mean(axis=0)
 
-        num_outputs = len(prediction) # Check how many possible phases there are
+        num_outputs = len(prediction)
+        all_preds = [np.argmax(pred) for pred in result_arr]
 
-        all_preds = [np.argmax(pred) for pred in result] ## Individual max indices (associated with phases)
+        counts = [all_preds.count(idx) for idx in set(all_preds)]
 
-        counts = []
-        for index in set(all_preds):
-            counts.append(all_preds.count(index)) ## Tabulate how many times each prediction arises
-
-        certanties = []
+        certainties = []
         for each_count in counts:
-            conf = each_count/sum(counts)
+            conf = each_count / sum(counts)
             if conf >= min_conf:
-                certanties.append(conf)
-        certanties = sorted(certanties, reverse=True)
+                certainties.append(conf)
+        certainties = sorted(certainties, reverse=True)
 
-        return prediction, len(certanties), certanties, num_outputs
+        return prediction, len(certainties), certainties, num_outputs
 
 
 class PhaseIdentifier(object):
@@ -659,7 +630,7 @@ class PhaseIdentifier(object):
     """
 
     def __init__(self, spectra_directory, reference_directory, max_phases, cutoff_intensity, min_conf, wavelength,
-        min_angle=10.0, max_angle=80.0, parallel=True, model_path='Model.h5', is_pdf=False):
+        min_angle=10.0, max_angle=80.0, parallel=True, model_path='Model.pth', is_pdf=False):
         """
         Args:
             spectra_dir: path to directory containing the xrd
@@ -877,7 +848,7 @@ def merge_results(results, cutoff, max_phases):
 
 
 def main(spectra_directory, reference_directory, max_phases=3, cutoff_intensity=10, min_conf=10.0,wavelength='CuKa',
-    min_angle=10.0, max_angle=80.0, parallel=True, model_path='Model.h5', is_pdf=False):
+    min_angle=10.0, max_angle=80.0, parallel=True, model_path='Model.pth', is_pdf=False):
 
     phase_id = PhaseIdentifier(spectra_directory, reference_directory, max_phases,
         cutoff_intensity, min_conf, wavelength, min_angle, max_angle, parallel, model_path, is_pdf)

@@ -42,12 +42,12 @@ if __name__ == '__main__':
 
     # Ensure an XRD model has already been trained, but not yet a PDF model
     assert 'Models' not in os.listdir('.'), 'Models folder already exists. Please remove it or use existing models.'
-    assert 'Model.h5' in os.listdir('.'), 'Cannot find a trained Model.h5 file in current directory. Please train an XRD model first.'
+    assert 'Model.pth' in os.listdir('.'), 'Cannot find a trained Model.pth file in current directory. Please train an XRD model first.'
     assert 'References' in os.listdir('.'), 'Cannot find a References folder in your current directory.'
 
     # Move trained XRD model to new directory
     os.mkdir('Models')
-    os.rename('Model.h5', 'Models/XRD_Model.h5')
+    os.rename('Model.pth', 'Models/XRD_Model.pth')
 
     # Simualted vrtual PDFs
     pdf_obj = spectrum_generation.SpectraGenerator('References', num_spectra, max_texture, min_domain_size,
@@ -61,5 +61,5 @@ if __name__ == '__main__':
     # Train, test, and save the CNN
     test_fraction = 0.2
     cnn.main(pdf_specs, num_epochs, test_fraction, is_pdf=True)
-    os.rename('Model.h5', 'Models/PDF_Model.h5')
+    os.rename('Model.pth', 'Models/PDF_Model.pth')
 

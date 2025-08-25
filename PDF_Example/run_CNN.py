@@ -61,9 +61,9 @@ if __name__ == '__main__':
 
     # Path to trained CNN model
     if inc_pdf:
-        model_path = 'Models/XRD_Model.h5'
+        model_path = 'Models/XRD_Model.pth'
     else:
-        model_path = 'Model.h5'
+        model_path = 'Model.pth'
 
     # Used for writing temporary files
     if not os.path.exists('temp'):
@@ -76,7 +76,7 @@ if __name__ == '__main__':
 
     if inc_pdf:
         # If specified, get predictions from PDF analysis
-        model_path = 'Models/PDF_Model.h5'
+        model_path = 'Models/PDF_Model.pth'
         results['PDF']['filenames'], results['PDF']['phases'], results['PDF']['confs'], results['PDF']['backup_phases'], \
             results['PDF']['scale_factors'], results['PDF']['reduced_spectra'] = spectrum_analysis.main('Spectra', 'References',
             max_phases, cutoff_intensity, min_conf, wavelength, min_angle, max_angle, parallel, model_path, is_pdf=True)
